@@ -1,0 +1,22 @@
+# Wi-Fi and broker passwords: never commit. Copy secrets.example.h instead.
+**/include/secrets.h
+
+# PlatformIO build output and downloaded libraries
+**/.pio/
+**/.vscode/*
+!**/.vscode/extensions.json
+
+# Font tooling: the .ttf files are downloaded (see tools/make_fonts.py) and
+# the .vlw files are intermediate output; fonts.h is what the firmware uses.
+**/tools/*.ttf
+**/tools/*.vlw
+*.vlw
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store

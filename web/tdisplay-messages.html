@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Send a Message</title>
+<style>
+:root{color-scheme:dark;--bg:#08090d;--panel:#151923;--field:#10141e;--line:#2a3040;--text:#f4f6fb;--muted:#9098aa;--accent:#a47fff;--ok:#64e6ad;--bad:#ff7d94;--warn:#ffc46b}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:radial-gradient(circle at 80% 0,#282044 0,transparent 38%),var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:32px 24px 48px}
+main{width:min(560px,100%);margin:0 auto;display:grid;gap:18px}
+header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:8px}
+h1{font-size:clamp(27px,6vw,40px);letter-spacing:-.04em;line-height:1.1;margin:0}
+p{color:var(--muted);margin:6px 0 0}
+.status{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px;white-space:nowrap}
+.dot{width:9px;height:9px;border-radius:50%;background:#566078;flex:none}
+.dot.on{background:var(--ok);box-shadow:0 0 16px var(--ok)}
+.dot.busy{background:var(--warn)}
+.dot.off{background:var(--bad)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:22px;padding:22px;box-shadow:0 20px 70px #0007;display:grid;gap:14px}
+button{border:0;border-radius:12px;padding:12px 17px;background:var(--accent);color:#100c18;font:inherit;font-weight:700;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}
+button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.message{min-height:24px;font-weight:600;overflow-wrap:anywhere}
+.message.ok{color:var(--ok)}.message.bad{color:var(--bad)}.message.warn{color:var(--warn)}
+label{display:grid;gap:6px;font-size:13px;color:var(--muted)}
+input[type=text],input[type=password],input[type=number],textarea{width:100%;background:var(--field);border:1px solid var(--line);border-radius:10px;padding:10px 12px;color:var(--text);font:inherit}
+textarea{min-height:120px;resize:vertical}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.grid .wide{grid-column:1/-1}
+.check{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+.count{font-size:12px;color:var(--muted);text-align:right;font-variant-numeric:tabular-nums}
+.count.bad{color:var(--bad)}
+summary{cursor:pointer;font-size:13px;color:var(--muted);border-radius:6px}
+details[open] summary{margin-bottom:12px}
+@media(max-width:520px){body{padding:18px 14px 32px}.card{padding:16px;border-radius:18px}header{align-items:flex-start;flex-direction:column}.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Send a Message</h1>
+      <p>Your note appears on the little petri-dish display, with your name.</p>
+    </div>
+    <div class="status"><i class="dot" id="dot"></i><span id="status">Not connected</span></div>
+  </header>
+
+  <section class="card">
+    <div class="grid">
+      <label class="wide">Your name<input type="text" id="name" autocomplete="nickname" maxlength="24" placeholder="Anna"></label>
+      <label>Username<input type="text" id="username" autocomplete="username" spellcheck="false"></label>
+      <label>Password<input type="password" id="password" autocomplete="current-password"></label>
+      <label class="check wide"><input type="checkbox" id="remember" checked> Remember me in this browser</label>
+    </div>
+    <details>
+      <summary>Broker address</summary>
+      <div class="grid">
+        <label class="wide">Host<input type="text" id="host" autocomplete="off" spellcheck="false" value="" placeholder="your-broker.example.com"></label>
+        <label>WebSocket port<input type="number" id="port" value="8084" min="1" max="65535"></label>
+        <label>WebSocket path<input type="text" id="path" autocomplete="off" spellcheck="false" value="/mqtt"></label>
+      </div>
+    </details>
+  </section>
+
+  <section class="card">
+    <label>Message<textarea id="text" placeholder="Thinking of you!"></textarea></label>
+    <div class="count" id="count">0 / 800</div>
+    <div class="actions"><button id="send" disabled>Send</button></div>
+    <div class="message" id="message"></div>
+  </section>
+</main>
+<script>
+'use strict';
+
+// This page can only ever send text messages to the friends' topic. The
+// display shows anything that arrives there as a message, nothing else.
+const MESSAGES_TOPIC = 'radio/messages';
+const MAX_NAME_BYTES = 24;
+const MAX_TEXT_BYTES = 800;
+
+// ---- Minimal MQTT 3.1.1 client over WebSocket (QoS 0 only) ----------------
+class MqttClient {
+  constructor(options) {
+    this.url = options.url;
+    this.username = options.username;
+    this.password = options.password;
+    this.clientId = options.clientId || 'tdisplay-friend-' + Math.random().toString(16).slice(2, 10);
+    this.keepAlive = options.keepAlive || 30;
+    this.onmessage = null;   // (topic, Uint8Array payload)
+    this.onclose = null;     // (reason string)
+    this.connected = false;
+    this.socket = null;
+    this.pending = new Uint8Array(0);
+    this.pingTimer = null;
+    this.nextPacketId = 1;
+    this.subscribeWaiters = new Map();
+    this.connectWaiter = null;
+  }
+
+  static encodeString(text) {
+    const bytes = new TextEncoder().encode(text);
+    const out = new Uint8Array(bytes.length + 2);
+    out[0] = bytes.length >> 8; out[1] = bytes.length & 0xff;
+    out.set(bytes, 2);
+    return out;
+  }
+
+  static packet(firstByte, parts) {
+    let length = 0;
+    for (const part of parts) length += part.length;
+    const lengthBytes = [];
+    let remaining = length;
+    do {
+      let digit = remaining % 128;
+      remaining = Math.floor(remaining / 128);
+      if (remaining > 0) digit |= 0x80;
+      lengthBytes.push(digit);
+    } while (remaining > 0);
+    const out = new Uint8Array(1 + lengthBytes.length + length);
+    out[0] = firstByte;
+    out.set(lengthBytes, 1);
+    let position = 1 + lengthBytes.length;
+    for (const part of parts) { out.set(part, position); position += part.length; }
+    return out;
+  }
+
+  connect(timeoutMs = 10000) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.connectWaiter = null;
+        if (error) { this.close(); reject(error); } else resolve();
+      };
+      const timer = setTimeout(() => finish(new Error('The broker did not answer in time.')), timeoutMs);
+      this.connectWaiter = finish;
+      try {
+        this.socket = new WebSocket(this.url, ['mqtt']);
+      } catch (error) {
+        finish(new Error('The broker address is not valid.'));
+        return;
+      }
+      this.socket.binaryType = 'arraybuffer';
+      this.socket.onopen = () => {
+        const flags = 0x02 | (this.username ? 0x80 : 0) | (this.username && this.password ? 0x40 : 0);
+        const parts = [
+          MqttClient.encodeString('MQTT'),
+          new Uint8Array([0x04, flags, this.keepAlive >> 8, this.keepAlive & 0xff]),
+          MqttClient.encodeString(this.clientId),
+        ];
+        if (this.username) parts.push(MqttClient.encodeString(this.username));
+        if (this.username && this.password) parts.push(MqttClient.encodeString(this.password));
+        this.socket.send(MqttClient.packet(0x10, parts));
+      };
+      this.socket.onmessage = (event) => this.receive(new Uint8Array(event.data));
+      this.socket.onerror = () => finish(new Error('Could not reach the broker. Check the host, port and path.'));
+      this.socket.onclose = () => {
+        const wasConnected = this.connected;
+        this.cleanup();
+        finish(new Error('The broker closed the connection.'));
+        if (wasConnected && this.onclose) this.onclose('Connection to the broker was lost.');
+      };
+    });
+  }
+
+  receive(chunk) {
+    const merged = new Uint8Array(this.pending.length + chunk.length);
+    merged.set(this.pending); merged.set(chunk, this.pending.length);
+    let position = 0;
+    for (;;) {
+      if (merged.length - position < 2) break;
+      let length = 0, multiplier = 1, index = position + 1, complete = false;
+      while (index < merged.length && index < position + 5) {
+        const digit = merged[index++];
+        length += (digit & 0x7f) * multiplier;
+        multiplier *= 128;
+        if (!(digit & 0x80)) { complete = true; break; }
+      }
+      if (!complete || merged.length - index < length) break;
+      this.handlePacket(merged[position], merged.subarray(index, index + length));
+      position = index + length;
+    }
+    this.pending = merged.slice(position);
+  }
+
+  handlePacket(firstByte, body) {
+    const type = firstByte >> 4;
+    if (type === 2) {            // CONNACK
+      const code = body[1];
+      if (code === 0) {
+        this.connected = true;
+        this.pingTimer = setInterval(() => this.sendRaw(new Uint8Array([0xc0, 0x00])), this.keepAlive * 500);
+        if (this.connectWaiter) this.connectWaiter(null);
+      } else if (this.connectWaiter) {
+        const reasons = {
+          1: 'The broker does not accept this MQTT version.',
+          2: 'The broker rejected the client ID.',
+          3: 'The broker is unavailable.',
+          4: 'Wrong username or password.',
+          5: 'This account is not allowed to connect.',
+        };
+        this.connectWaiter(new Error(reasons[code] || 'The broker refused the connection (code ' + code + ').'));
+      }
+    } else if (type === 3) {     // PUBLISH
+      const topicLength = (body[0] << 8) | body[1];
+      const topic = new TextDecoder().decode(body.subarray(2, 2 + topicLength));
+      const qos = (firstByte >> 1) & 3;
+      const start = 2 + topicLength + (qos > 0 ? 2 : 0);
+      if (this.onmessage) this.onmessage(topic, body.slice(start));
+    } else if (type === 9) {     // SUBACK
+      const id = (body[0] << 8) | body[1];
+      const waiter = this.subscribeWaiters.get(id);
+      if (waiter) { this.subscribeWaiters.delete(id); waiter(body[2] !== 0x80); }
+    }
+  }
+
+  sendRaw(bytes) {
+    if (!this.socket || this.socket.readyState !== 1) throw new Error('Not connected to the broker.');
+    this.socket.send(bytes);
+  }
+
+  // Resolves true when the broker granted the subscription, false otherwise.
+  subscribe(topic, timeoutMs = 5000) {
+    return new Promise((resolve) => {
+      const id = this.nextPacketId++ & 0xffff || 1;
+      const timer = setTimeout(() => { this.subscribeWaiters.delete(id); resolve(false); }, timeoutMs);
+      this.subscribeWaiters.set(id, (granted) => { clearTimeout(timer); resolve(granted); });
+      try {
+        this.sendRaw(MqttClient.packet(0x82, [new Uint8Array([id >> 8, id & 0xff]), MqttClient.encodeString(topic), new Uint8Array([0])]));
+      } catch (error) { clearTimeout(timer); this.subscribeWaiters.delete(id); resolve(false); }
+    });
+  }
+
+  publish(topic, payload) {
+    const bytes = typeof payload === 'string' ? new TextEncoder().encode(payload) : payload;
+    this.sendRaw(MqttClient.packet(0x30, [MqttClient.encodeString(topic), bytes]));
+  }
+
+  // Waits until the browser has handed most queued data to the network.
+  async drained(limit = 32768) {
+    while (this.socket && this.socket.readyState === 1 && this.socket.bufferedAmount > limit) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (!this.socket || this.socket.readyState !== 1) throw new Error('Connection to the broker was lost.');
+  }
+
+  cleanup() {
+    this.connected = false;
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.pingTimer = null;
+  }
+
+  close() {
+    this.cleanup();
+    if (this.socket) {
+      const socket = this.socket;
+      this.socket = null;
+      socket.onclose = null; socket.onerror = null; socket.onmessage = null;
+      try { if (socket.readyState === 1) socket.send(new Uint8Array([0xe0, 0x00])); } catch (_) {}
+      try { socket.close(); } catch (_) {}
+    }
+  }
+}
+
+// ---- Page ------------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const STORAGE_KEY = 'tdisplay-messages-settings';
+const fields = ['name', 'username', 'password', 'host', 'port', 'path'];
+const encoder = new TextEncoder();
+let client = null;
+let busy = false;
+
+function show(text, kind) { $('message').textContent = text; $('message').className = 'message ' + (kind || ''); }
+function setStatus(text, kind) { $('status').textContent = text; $('dot').className = 'dot ' + (kind || ''); }
+const byteLength = (text) => encoder.encode(text).length;
+
+function refresh() {
+  const bytes = byteLength($('text').value.trim());
+  $('count').textContent = bytes + ' / ' + MAX_TEXT_BYTES;
+  $('count').className = 'count' + (bytes > MAX_TEXT_BYTES ? ' bad' : '');
+  $('send').disabled = busy || bytes === 0 || bytes > MAX_TEXT_BYTES;
+}
+
+function loadSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+    if (!saved) return;
+    for (const field of fields) if (typeof saved[field] === 'string') $(field).value = saved[field];
+  } catch (_) { /* storage unavailable or damaged: start empty */ }
+}
+
+function saveSettings() {
+  try {
+    if (!$('remember').checked) { localStorage.removeItem(STORAGE_KEY); return; }
+    const values = {};
+    for (const field of fields) values[field] = $(field).value;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(values));
+  } catch (_) { /* storage unavailable: nothing is remembered */ }
+}
+
+async function connect() {
+  const host = $('host').value.trim(), username = $('username').value.trim();
+  if (!host) throw new Error('The broker address is missing. Open "Broker address" below the login.');
+  if (!username || !$('password').value) throw new Error('Enter the username and password you were given.');
+  if (client) client.close();
+  let path = $('path').value.trim() || '/mqtt';
+  if (!path.startsWith('/')) path = '/' + path;
+  setStatus('Connecting', 'busy');
+  client = new MqttClient({ url: 'wss://' + host + ':' + ($('port').value || 8084) + path, username, password: $('password').value });
+  client.onclose = () => setStatus('Disconnected', 'off');
+  try {
+    await client.connect();
+  } catch (error) {
+    setStatus('Not connected', 'off');
+    throw error;
+  }
+  setStatus('Connected', 'on');
+}
+
+$('send').onclick = async () => {
+  const name = $('name').value.trim();
+  const text = $('text').value.trim();
+  if (busy || !text) return;
+  if (!name) { show('Please enter your name, so they know who it is from.', 'bad'); $('name').focus(); return; }
+  if (byteLength(name) > MAX_NAME_BYTES) { show('Your name is too long. Please shorten it.', 'bad'); return; }
+  if (byteLength(text) > MAX_TEXT_BYTES) { show('The message is too long. Please shorten it.', 'bad'); return; }
+  busy = true; refresh();
+  try {
+    show('Connecting...', '');
+    if (!client || !client.connected) await connect();
+    saveSettings();
+    client.publish(MESSAGES_TOPIC, JSON.stringify({ from: name, text }));
+    // The broker gives no receipt for a message. If this account may not send
+    // here, it usually drops the connection straight away, so wait a moment.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    if (!client.connected) throw new Error('The broker did not accept the message. Check your login with whoever gave it to you.');
+    show('Sent! It will appear on the display in a moment.', 'ok');
+    $('text').value = '';
+  } catch (error) {
+    show(error.message, 'bad');
+  }
+  busy = false; refresh();
+};
+
+$('text').oninput = refresh;
+$('remember').onchange = saveSettings;
+loadSettings();
+refresh();
+</script>
+</body>
+</html>
